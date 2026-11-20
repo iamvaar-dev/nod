@@ -1,4 +1,4 @@
-import type { ModelSelection } from '../src/shared/models.ts';
+import { lightestEffort, type ModelSelection } from '../src/shared/models.ts';
 import type { Context } from '@earendil-works/pi-ai';
 import type { ModelAccess } from '../src/ports/models.ts';
 import { createPiModelBackend, createPiModelRuntime } from '../src/providers/pi/models.ts';
@@ -11945,12 +11945,12 @@ test('OpenRouter free routing can prepare a task when reasoning cannot be disabl
   assert.equal(calls, 1);
 });
 
-test('Ollama models with on or off thinking complete tasks without a named effort', async (t) => {
+test('Ollama models with on or off thinking keep the effort value the server reads', async (t) => {
   const original = globalThis.fetch;
   t.after(() => (globalThis.fetch = original));
   for (const thinking of [undefined, { values: [false, true] }, { values: [true] }]) {
     const onlyOn = thinking?.values.length === 1;
-    const enabled: Array<boolean | undefined> = [];
+    const efforts: Array<string | undefined> = [];
     globalThis.fetch = async (input, init) => {
       const request = new Request(input, init);
       const path = new URL(request.url).pathname;
@@ -11964,10 +11964,9 @@ test('Ollama models with on or off thinking complete tasks without a named effor
           thinking,
         });
       assert.equal(path, '/v1/chat/completions');
-      const body = (await request.json()) as { reasoning_effort?: string; think?: boolean };
-      assert.equal(body.reasoning_effort, undefined);
-      assert.equal(typeof body.think, thinking ? 'boolean' : 'undefined');
-      enabled.push(body.think);
+      const body = (await request.json()) as { reasoning_effort?: string; think?: unknown };
+      assert.equal(body.think, undefined);
+      efforts.push(body.reasoning_effort);
       return reply({ role: 'assistant', content: 'The synthetic task is complete.' });
     };
     const credential = { type: 'endpoint' as const, url: 'http://127.0.0.1:1/v1' };
@@ -11992,8 +11991,62 @@ test('Ollama models with on or off thinking complete tasks without a named effor
       );
       assert.equal(result.stopReason, 'stop');
     }
-    assert.deepEqual(enabled, thinking ? [true, onlyOn] : [undefined, undefined]);
+    assert.deepEqual(
+      efforts,
+      !thinking ? [undefined, undefined] : onlyOn ? ['high', undefined] : ['high', 'none'],
+    );
   }
+});
+
+test('the selected-model check turns thinking off on an Ollama boolean model', async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => (globalThis.fetch = original));
+  const efforts: Array<string | undefined> = [];
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const path = new URL(request.url).pathname;
+    if (path === '/v1/models') return Response.json({ data: [{ id: 'qwen3:8b' }] });
+    if (path === '/api/version') return Response.json({ version: '0.40.16' });
+    if (path === '/api/v1/models') return new Response(null, { status: 404 });
+    if (path === '/api/show')
+      return Response.json({
+        capabilities: ['completion', 'tools', 'thinking'],
+        model_info: { 'qwen3.context_length': 65536 },
+        thinking: { values: [false, true], default: true },
+      });
+    assert.equal(path, '/v1/chat/completions');
+    const body = (await request.json()) as { reasoning_effort?: string };
+    efforts.push(body.reasoning_effort);
+    return body.reasoning_effort === 'none'
+      ? reply({ role: 'assistant', content: '{"ok":true}' })
+      : reply({ role: 'assistant', content: '' }, 'length');
+  };
+  const credential = { type: 'endpoint' as const, url: 'http://127.0.0.1:1/v1' };
+  const [definition] = await createPiModelBackend({ fetch: globalThis.fetch }).catalog(
+    'compatible',
+    'api_key',
+    credential,
+  );
+  assert.deepEqual(definition.choice.efforts, ['off', 'high']);
+  const selected: ModelAccess = {
+    provider: 'compatible',
+    method: 'api_key',
+    definition,
+    effort: lightestEffort(definition.choice.efforts),
+    read: async () => credential,
+  };
+  const curator = createPiMemoryCurator({
+    provider: 'compatible',
+    resolve: async () => selected,
+  });
+  assert.deepEqual(
+    await curator.curate(
+      { task: 'check', instructions: 'Return only {"ok":true}.', input: {}, automatic: false },
+      AbortSignal.timeout(30_000),
+    ),
+    { ok: true },
+  );
+  assert.deepEqual(efforts, ['none']);
 });
 
 test('a rewritten tool call id never takes an id already in the conversation', async (t) => {

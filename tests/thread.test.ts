@@ -36,7 +36,7 @@ import {
 import type { ConnectedApp } from '../src/ports/integrations.ts';
 import type { MemoryCurator } from '../src/ports/memory-curator.ts';
 import { ObjectStoreConflict, type PrivateObjectStore } from '../src/ports/object-storage.ts';
-import { createAgentRuntime } from '../src/runtime/index.ts';
+import { createAgentRuntime, webTarget } from '../src/runtime/index.ts';
 import { compactOwnerContext, firstInstruction, ownerContext } from '../src/runtime/prompt.ts';
 import { createPreferencesStore } from '../src/server/preferences.ts';
 import type { ThreadDependencies } from '../src/server/thread.ts';
@@ -1633,6 +1633,7 @@ test(
           { channel: 'telegram:fixture', sourceId, replyToMessageId: targetId },
           {
             answer: async () => undefined,
+            close: async () => {},
             accept: async () => {
               enter();
               await proceed;
@@ -3199,6 +3200,29 @@ test(
           await completed(input.turnId, 'immediate', true, 'no_reply');
           const delivered = await taskTurn(input.messageId);
           await completed(delivered, 'background', true, 'reply');
+          const workOf = async (id: string) =>
+            (await request('GET', '/api/state'))
+              .json()
+              .messages.find((entry: { id: string }) => entry.id === id)?.work;
+          assert.deepEqual(await workOf(input.messageId), {
+            kind: 'task',
+            id: taskId,
+            title: 'Synthetic analytics task',
+            turnId: delivered,
+          });
+          assert.equal(await workOf(start.messageId), undefined);
+          const quoted = async (turnId: string) =>
+            (
+              (await request('GET', '/api/state')).json().messages as Array<{
+                role: string;
+                turnId: string | null;
+                replyTo?: { id: string; role: string } | null;
+              }>
+            )
+              .filter((entry) => entry.role === 'assistant' && entry.turnId === turnId)
+              .map((entry) => entry.replyTo && [entry.replyTo.id, entry.replyTo.role]);
+          assert.deepEqual(await quoted(created), [[start.messageId, 'user']]);
+          assert.deepEqual(await quoted(delivered), [[input.messageId, 'user']]);
           const continued = await thread.enqueueTurn('Synthetic task continuation', {
             source: 'resume',
             sessionId: taskId,
@@ -5502,6 +5526,7 @@ test(
             const calls: string[] = [];
             const guarded = thread.createUserMessageService({
               confirmAction: {
+                close: async () => {},
                 answer: async () => {
                   calls.push('classify');
                   return undefined;
@@ -9095,7 +9120,7 @@ test(
                           /check-in/,
                         );
                         await tool('ask_user').execute({
-                          question: 'The synthetic check used six dollars. Continue?',
+                          question: 'The synthetic check used {spent}. Continue?',
                         });
                       },
                     }),
@@ -9134,10 +9159,12 @@ test(
                   assert.equal(await engine.due(), paused);
                   const question = (
                     await db.pool.query(
-                      "SELECT id FROM messages WHERE turn_id=$1 AND owner_id=$2 AND role='assistant'",
+                      "SELECT id,text FROM messages WHERE turn_id=$1 AND owner_id=$2 AND role='assistant'",
                       [paused, ownerId],
                     )
                   ).rows[0];
+                  assert.match(question.text, /\$6\b/);
+                  assert.doesNotMatch(question.text, /\{spent\}/);
                   const answer = await userMessages.submit('Continue the synthetic observer.', [], {
                     replyToMessageId: question.id,
                   });
@@ -14142,6 +14169,18 @@ test('the onboarding brief masks each link and keeps the fields after it', async
   assert.ok(!brief.includes('zzz'));
 });
 
+test('a web search label keeps a known secret out even when operators or quotes split it', async () => {
+  const { createTextRedactor } = await import('../src/server/redaction.ts');
+  const redact = createTextRedactor(['synthetic alpha beta']);
+  const label = webTarget(
+    'web_search',
+    { query: 'password:"synthetic alpha beta" forecast' },
+    redact,
+  );
+  assert.deepEqual(label, { detail: 'forecast' });
+  assert.doesNotMatch(JSON.stringify(label), /alpha|beta/);
+});
+
 test(
   'the live line uses an active tool label, drops old steps, and keeps work Nod started apart',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
@@ -14159,7 +14198,7 @@ test(
         CREATE TABLE tasks(id uuid PRIMARY KEY, owner_id text NOT NULL, session_id uuid, title text, now_text text,
           message_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE turn_events(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), turn_id uuid, type text, summary text DEFAULT '',
-          site text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
+          site text, detail text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
         CREATE INDEX turn_events_progress ON turn_events(turn_id,created_at,id) WHERE type IN ('step','steered');
         CREATE TABLE messages(id uuid PRIMARY KEY, owner_id text, turn_id uuid, role text, created_at timestamptz DEFAULT now())`);
       const { createActivity } = await import('../src/server/activity.ts');
@@ -14302,7 +14341,7 @@ test(
         [chat],
       );
       item = await live();
-      assert.equal(item.recent?.length, 4);
+      assert.equal(item.recent?.length, 3);
       assert.deepEqual(item.recent?.[0], {
         id: completed.rows[0]!.id,
         summary: 'Checking the synthetic report',
@@ -14445,6 +14484,103 @@ test(
         ]);
         await ungrouped();
       }
+      const { recordIntent } = await import('../src/server/thread.ts');
+      const asked = randomUUID();
+      const askedThread = randomUUID();
+      await pool.query('INSERT INTO threads(id,owner_id) VALUES($1,$2)', [askedThread, owner]);
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status,started_at) VALUES($1,$2,$3,$3,'user','running',now())",
+        [asked, owner, askedThread],
+      );
+      const intent = async () => (await activity.read()).find((entry) => entry.turnId === asked)!;
+      const client = await pool.connect();
+      try {
+        await recordIntent(client, asked, 'Checking the synthetic weather');
+        await recordIntent(client, asked, 'A second synthetic line');
+      } finally {
+        client.release();
+      }
+      assert.equal((await intent()).step, 'Checking the synthetic weather');
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,call_id) VALUES($1,'tool_start','web search',$2)",
+        [asked, randomUUID()],
+      );
+      item = await intent();
+      assert.equal(item.step, 'Checking the synthetic weather');
+      assert.equal(item.tool, 'Searching the web');
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,created_at) VALUES($1,'thought','Comparing synthetic forecasts',now()+interval '1 second')",
+        [asked],
+      );
+      assert.equal((await intent()).step, 'Comparing synthetic forecasts');
+      const search = randomUUID();
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,detail,call_id,created_at) VALUES($1,'tool_start','web search','synthetic forecast',$2,now()+interval '2 seconds')",
+        [asked, search],
+      );
+      assert.equal((await intent()).tool, 'Searching “synthetic forecast”');
+      await pool.query(
+        `INSERT INTO turn_events(turn_id,type,summary,detail,site,call_id,created_at) VALUES
+          ($1,'tool_complete','web search','synthetic forecast',NULL,$2,now()+interval '3 seconds'),
+          ($1,'tool_complete','tool search',NULL,NULL,$3,now()+interval '4 seconds'),
+          ($1,'tool_complete','fetch content',NULL,'forecast.example',$4,now()+interval '5 seconds')`,
+        [asked, search, randomUUID(), randomUUID()],
+      );
+      assert.deepEqual(
+        (await intent()).recent?.map(({ summary, site }) => [summary, site]),
+        [
+          ['Read forecast.example', null],
+          ['Searched “synthetic forecast”', null],
+        ],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,created_at) VALUES($1,'steered',now()+interval '6 seconds')",
+        [asked],
+      );
+      item = await intent();
+      assert.equal(item.step, null);
+      assert.equal(item.recent, undefined);
+      const steeredClient = await pool.connect();
+      try {
+        await recordIntent(steeredClient, asked, 'Checking the synthetic follow-up');
+        await pool.query(
+          "UPDATE turn_events SET created_at=now()+interval '7 seconds' WHERE turn_id=$1 AND type='intent' AND summary='Checking the synthetic follow-up'",
+          [asked],
+        );
+        assert.notEqual((await intent()).step, 'Checking the synthetic follow-up');
+        await recordIntent(steeredClient, asked, 'Checking the synthetic follow-up', 1);
+        await pool.query(
+          "UPDATE turn_events SET created_at=now()+interval '7 seconds' WHERE turn_id=$1 AND type='intent' AND summary='Checking the synthetic follow-up'",
+          [asked],
+        );
+      } finally {
+        steeredClient.release();
+      }
+      assert.equal((await intent()).step, 'Checking the synthetic follow-up');
+      const late = randomUUID();
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status,started_at) VALUES($1,$2,$3,$3,'user','running',now())",
+        [late, owner, askedThread],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary) VALUES($1,'step','Reading synthetic notes')",
+        [late],
+      );
+      const lateClient = await pool.connect();
+      try {
+        await recordIntent(lateClient, late, 'Too late synthetic line');
+      } finally {
+        lateClient.release();
+      }
+      assert.equal(
+        (
+          await pool.query(
+            "SELECT count(*)::int AS n FROM turn_events WHERE turn_id=$1 AND type='intent'",
+            [late],
+          )
+        ).rows[0].n,
+        0,
+      );
     } finally {
       await pool.end();
       await admin.query(`DROP SCHEMA ${schema} CASCADE`);
@@ -14483,7 +14619,7 @@ test(
         CREATE TABLE tasks(id uuid PRIMARY KEY, owner_id text NOT NULL, session_id uuid, title text, now_text text,
           message_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE turn_events(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), turn_id uuid, type text, summary text DEFAULT '',
-          site text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
+          site text, detail text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE messages(id uuid PRIMARY KEY, owner_id text, turn_id uuid, role text, created_at timestamptz DEFAULT now())`);
       const threadId = randomUUID();
       const scheduled = randomUUID();

@@ -619,7 +619,8 @@ export function createLedger({
                   ? 'task_classification'
                   : request.task === 'vision' ||
                       request.task === 'attention' ||
-                      request.task === 'check'
+                      request.task === 'check' ||
+                      request.task === 'activity'
                     ? 'agent'
                     : request.task === 'review' || request.task === 'access'
                       ? 'review'

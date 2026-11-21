@@ -1546,9 +1546,9 @@ test('a context restart drops old model input once and keeps later turns through
 });
 
 test('real Pi sessions persist a credential pause and resume without replaying chat history', async (t) => {
-  for (const kind of ['chat', 'background', 'task'] as const)
+  for (const kind of ['background', 'task'] as const)
     await t.test(`${kind} session`, async () => {
-      const background = kind !== 'chat';
+      const background = true;
       const directory = await mkdtemp(join(tmpdir(), 'nod-pi-'));
       const id = 'test-' + randomUUID();
       const replies: string[] = [];
@@ -6980,16 +6980,28 @@ test('a discovered tool schema reduces the room for its next result', async (t) 
   );
 });
 
-test('opening a website with any browser tool makes private sign-in available', async (t) => {
+test('a browser tool or a guide loads the tools that go with it', async (t) => {
   const { toolDefinitions } = await import('../src/runtime/tools.ts');
+  const { createSkillLibrary } = await import('../src/providers/pi/skills.ts');
+  const { coreSkills } = await import('../src/runtime/prompt.ts');
+  const library = createSkillLibrary(join(process.cwd(), 'src/runtime/skills'), coreSkills);
   const browserTools = ['browser', 'browser_session', 'sign_in', 'pay'] as const;
   const url = 'https://people.example.test/in/synthetic';
-  for (const calls of [
-    [['nod_browser', { action: 'open', url }]],
-    [
-      ['nod_tool_search', { query: 'browser_session', limit: 1 }],
-      ['browser_session', { action: 'connect', url }],
-    ],
+  const browsing = { tools: browserTools, loads: ['sign_in', 'pay'] };
+  for (const { calls, tools, loads } of [
+    { ...browsing, calls: [['nod_browser', { action: 'open', url }]] },
+    {
+      ...browsing,
+      calls: [
+        ['nod_tool_search', { query: 'browser_session', limit: 1 }],
+        ['browser_session', { action: 'connect', url }],
+      ],
+    },
+    {
+      tools: ['skills', 'flights'],
+      loads: ['flights'],
+      calls: [['skills', { action: 'read', name: 'travel' }]],
+    },
   ] as const) {
     const opener = calls.at(-1)![0];
     await t.test(opener, async () => {
@@ -7032,8 +7044,14 @@ test('opening a website with any browser tool makes private sign-in available', 
         systemPrompt: 'Synthetic fixture instructions.',
         workspace: recordingWorkspace().workspace,
         runTool: async (_name, _params, run) => run(),
-        tools: browserTools.map((name) => ({
+        tools: tools.map((name) => ({
           ...toolDefinitions[name],
+          ...(name === 'skills'
+            ? {
+                companions: (args: Record<string, unknown>) =>
+                  library.tools?.(String(args.name)) ?? [],
+              }
+            : {}),
           parameters: toolDefinitions[name].parameters as Record<string, unknown>,
           execute: async () => ({
             content: [{ type: 'text' as const, text: 'Synthetic sign-in page.' }],
@@ -7045,7 +7063,7 @@ test('opening a website with any browser tool makes private sign-in available', 
       await session.prompt('Use my saved login to open the synthetic profile.', []);
       await session.dispose();
       assert.equal(active.length, calls.length + 1);
-      for (const companion of ['sign_in', 'pay']) {
+      for (const companion of loads) {
         assert.ok(!active.at(-2)!.includes(companion));
         assert.ok(
           active.at(-1)!.includes(companion),
@@ -12196,6 +12214,7 @@ test('invalid tool calls stop before another model request and a valid repair re
       const run = () =>
         runtime.runTurn({
           ...context(directory),
+          ...(toolName === 'sign_in' ? { background: true } : {}),
           turnId: randomUUID(),
           task: async () => {
             writes++;

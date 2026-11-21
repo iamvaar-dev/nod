@@ -41,6 +41,7 @@ Nod excludes:
 - Checks of emails that may give access to an account.
 - Requests to decision services.
 - Separate requests to the models that write your memory, writing style or learned skills.
+- The request to a small model that writes the short line about your request in the chat's status line.
 - Attention and review tasks.
 - Codemode scripts and results.
 - Usage events, which have their own switch.

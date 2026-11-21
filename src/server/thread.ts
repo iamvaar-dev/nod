@@ -79,6 +79,7 @@ import type { ExecutionEvent } from '../shared/execution.ts';
 import { modelProviderNames, type ModelSelection, type WorkKind } from '../shared/models.ts';
 import { lockKey } from './locks.ts';
 import { redactSecretText } from './redaction.ts';
+import { loadConversationLanguage } from './communication.ts';
 import { resemblesTaskAcknowledgement } from '../shared/task-ack.ts';
 
 const queue = 'thread-drain';
@@ -160,6 +161,7 @@ type ConfirmAction = {
     input: ChatConfirmationInput,
     onInserted?: () => void,
   ): Promise<ChatConfirmationResult>;
+  close(client: PoolClient, sessionId: string, turnId: string): Promise<void>;
 };
 
 export interface ThreadDependencies {
@@ -183,6 +185,11 @@ export interface ThreadDependencies {
   ) => Promise<void>;
   taskChecks?: (threadId: string) => Promise<void>;
   taskClassification?: boolean;
+  activityLine?: (
+    turnId: string,
+    input: { text: string; question?: string },
+    signal: AbortSignal,
+  ) => Promise<string>;
   consumers?: WorkConsumers;
   artifacts?: ArtifactService;
   writeArtifact?: (
@@ -363,7 +370,7 @@ async function insertEvent(
   event?: ExecutionEvent,
 ) {
   await client.query(
-    'INSERT INTO turn_events(id,turn_id,type,summary,run_id,parent_run_id,session_id,browser_id,call_id,site,command) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
+    'INSERT INTO turn_events(id,turn_id,type,summary,run_id,parent_run_id,session_id,browser_id,call_id,site,command,detail) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)',
     [
       randomUUID(),
       turnId,
@@ -376,8 +383,54 @@ async function insertEvent(
       event?.callId ?? null,
       event?.site ?? null,
       event?.command ?? null,
+      event?.detail ?? null,
     ],
   );
+}
+
+export async function recordIntent(client: PoolClient, turnId: string, line: string, steers = 0) {
+  await client.query(
+    `WITH s AS (SELECT COALESCE(max(created_at),'-infinity') AS at,count(*)::int AS n FROM turn_events
+       WHERE turn_id=$2 AND type='steered')
+     INSERT INTO turn_events(id,turn_id,type,summary) SELECT $1,$2,'intent',$3 FROM s
+     WHERE s.n=$4
+       AND NOT EXISTS (SELECT 1 FROM turn_events e WHERE e.turn_id=$2
+         AND e.type IN ('intent','step','thought','retry','final') AND e.created_at>=s.at)
+       AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.turn_id=$2 AND m.role='assistant'
+         AND m.created_at>=s.at)`,
+    [randomUUID(), turnId, line, steers],
+  );
+}
+
+async function showIntent(
+  turn: { id: string; owner_id: string; parent_turn_id: string | null },
+  text: string,
+  steers: number,
+  write: NonNullable<ThreadDependencies['activityLine']>,
+  signal: AbortSignal,
+  current: <T>(operation: (client: PoolClient) => Promise<T>) => Promise<T>,
+) {
+  let question: string | undefined;
+  if (turn.parent_turn_id && !steers) {
+    const asked = (
+      await pool.query<{ text: string }>(
+        `SELECT m.text FROM turns p JOIN messages m ON m.turn_id=p.id AND m.owner_id=p.owner_id
+         WHERE p.id=$1 AND p.owner_id=$2 AND p.waiting_reason='question' AND m.role='assistant'
+         ORDER BY m.created_at DESC,m.id DESC LIMIT 1`,
+        [turn.parent_turn_id, turn.owner_id],
+      )
+    ).rows[0];
+    if (!asked) return;
+    question = asked.text;
+  }
+  const line = await write(
+    turn.id,
+    { text, ...(question ? { question } : {}) },
+    AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+  );
+  if (!line) return;
+  await current((client) => recordIntent(client, turn.id, line, steers));
+  working();
 }
 
 async function assertReplyTarget(
@@ -892,6 +945,7 @@ export async function submitUserMessage(
       ],
     );
     if (taskTarget) await taskTarget.record(turnId);
+    if (live) await confirmAction?.close(client, question?.session_id ?? thread.id, turnId);
     const prepared = (await options.prepareAttachments?.(client, thread.id)) ?? [];
     await client.query(
       "INSERT INTO messages(id,owner_id,role,text,display_text,thread_id,turn_id,attachments,reply_to_message_id,reply_quote,audio_caption,question_answer) VALUES($1,$2,'user',$3,$4,$5,$6,$7,$8,$9,$10,$11)",
@@ -1832,6 +1886,7 @@ async function loadTurnContext(turn: any, dependencies: ThreadDependencies) {
     mcpServers,
     confirmedActions,
     restarted,
+    language,
   ] = await Promise.all([
     loadMessage(sourceMessageId),
     pool.query(
@@ -1876,6 +1931,7 @@ async function loadTurnContext(turn: any, dependencies: ThreadDependencies) {
           [threadId, ownerId],
         )
       : undefined,
+    loadConversationLanguage(pool, ownerId, threadId),
   ]);
   const preference = preferences.rows[0];
   const historyTurnIds = [
@@ -1927,6 +1983,7 @@ async function loadTurnContext(turn: any, dependencies: ThreadDependencies) {
       ...(confirmedActions?.length ? { confirmedActions } : {}),
       ...(credentialRequests.length ? { credentialRequests } : {}),
       ...(related.length ? { relatedConversation: related } : {}),
+      conversationLanguage: language,
       ...(learnedSkills?.length ? { learnedSkills } : {}),
       ...(connectedApps ? { connectedApps } : {}),
       ...(dependencies.localFiles ? { localFiles: true } : {}),
@@ -2022,6 +2079,23 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
     return withTurnLock({ turnId, signal }, operation);
   };
   const ensureCurrent = () => current(async () => {});
+  const intentLine =
+    dependencies.activityLine &&
+    !turn.background &&
+    turn.session_id === threadId &&
+    providerChannel === 'web'
+      ? dependencies.activityLine
+      : undefined;
+  const intentFailed = (error: unknown) => {
+    if (!signal.aborted) logFailure('activity_line_failed', error, { threadId, turnId });
+  };
+  if (
+    intentLine &&
+    turn.source === 'user' &&
+    !String(turn.source_id ?? '').startsWith('reaction-reply:') &&
+    String(turn.prompt ?? '').trim()
+  )
+    void showIntent(turn, turn.prompt, 0, intentLine, signal, current).catch(intentFailed);
   const fenced =
     <A extends unknown[], R>(call: (...args: A) => Promise<R>) =>
     async (...args: A) => {
@@ -2478,6 +2552,22 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
               if (taken.length) {
                 sourceMessageId = taken.at(-1)!.id;
                 refresh();
+                if (intentLine && taken.at(-1)!.text.trim()) {
+                  const steers = (
+                    await pool.query<{ n: number }>(
+                      "SELECT count(*)::int AS n FROM turn_events WHERE turn_id=$1 AND type='steered'",
+                      [turnId],
+                    )
+                  ).rows[0]!.n;
+                  void showIntent(
+                    turn,
+                    taken.at(-1)!.text,
+                    steers + 1,
+                    intentLine,
+                    signal,
+                    current,
+                  ).catch(intentFailed);
+                }
               }
               const messages = [];
               for (const message of taken) {

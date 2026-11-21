@@ -74,6 +74,8 @@ function supportedModel(model: Model<Api>): Model<Api> {
     return { ...model, compat: { ...model.compat, supportsStrictMode: false } };
   if (model.provider === 'openrouter' && model.id === 'openrouter/free')
     return { ...model, thinkingLevelMap: { ...model.thinkingLevelMap, off: null } };
+  if (model.provider === 'compatible' && model.thinkingLevelMap?.high === 'true')
+    return { ...model, thinkingLevelMap: { ...model.thinkingLevelMap, high: 'high' } };
   return model;
 }
 
